@@ -27,8 +27,10 @@ package resp
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
+	"strings"
 )
 
 // Type is the one-byte RESP type prefix.
@@ -82,115 +84,141 @@ func NewReader(rd io.Reader) *Reader {
 }
 
 // Read parses one complete RESP value from the stream.
-//
-// TODO: implement this.
-//
-// Steps:
-//  1. Read a single byte — this is the type prefix.
-//  2. Switch on it and dispatch to the matching read*/parse* helper below.
-//  3. If the byte doesn't match any known Type, return an error wrapping
-//     ErrProtocol (don't panic, don't silently ignore it — a real client
-//     could send anything).
-//
-// Hint: r.r.ReadByte() reads exactly one byte and is the right tool here
-// — don't use ReadString or Scanner for the type prefix.
 func (r *Reader) Read() (Value, error) {
-	// TODO: implement
-	return Value{}, errors.New("not implemented")
+	typeByte, err := r.r.ReadByte()
+	if err != nil {
+		return Value{}, err
+	}
+
+	switch Type(typeByte) {
+	case SimpleString:
+		return r.readSimpleString()
+	case Error:
+		return r.readError()
+	case Integer:
+		return r.readInteger()
+	case BulkString:
+		return r.readBulkString()
+	case Array:
+		return r.readArray()
+	default:
+		return Value{}, fmt.Errorf("%w: unknown type prefix %q", ErrProtocol, typeByte)
+	}
 }
 
 // readLine reads bytes up to and including "\r\n" and returns the line
 // WITHOUT the trailing \r\n.
 //
-// TODO: implement this.
-//
 // This is used for every RESP line that ISN'T raw binary payload
 // (i.e. everything except the actual bytes of a bulk string body):
 // the first line of a simple string, error, integer, bulk-string length
 // header, and array length header.
-//
-// Hint: bufio.Reader has a ReadString method. Read up to '\n', then trim
-// both '\r' and '\n' off the end. Watch out for a client that sends a
-// line with no trailing \r before \n — decide how strict you want to be
-// and note the tradeoff in a comment.
 func (r *Reader) readLine() (string, error) {
-	// TODO: implement
-	return "", errors.New("not implemented")
+	line, err := r.r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	// Design choice: TrimRight strips a trailing \r AND \n regardless of
+	// whether the \r is actually present. Strict RESP always sends \r\n,
+	// but being lenient here costs nothing and tolerates a client (or a
+	// human typing into `nc`) that only sends \n. A stricter parser
+	// could instead check for an exact "\r\n" suffix and return
+	// ErrProtocol if the \r is missing — worth naming as a tradeoff.
+	line = strings.TrimRight(line, "\r\n")
+	return line, nil
 }
 
 // readSimpleString parses everything after a '+' prefix.
-//
-// TODO: implement this. It's the simplest case — one line, no length
-// prefix, no binary data. Use it to sanity-check your readLine before
-// tackling the harder cases below.
 func (r *Reader) readSimpleString() (Value, error) {
-	// TODO: implement
-	return Value{}, errors.New("not implemented")
+	line, err := r.readLine()
+	if err != nil {
+		return Value{}, err
+	}
+	return Value{Type: SimpleString, Str: line}, nil
 }
 
 // readError parses everything after a '-' prefix. Structurally
 // identical to readSimpleString but tagged as Type Error.
-//
-// TODO: implement this.
 func (r *Reader) readError() (Value, error) {
-	// TODO: implement
-	return Value{}, errors.New("not implemented")
+	line, err := r.readLine()
+	if err != nil {
+		return Value{}, err
+	}
+	return Value{Type: Error, Str: line}, nil
 }
 
 // readInteger parses everything after a ':' prefix into Value.Num.
-//
-// TODO: implement this.
-//
-// Hint: strconv.ParseInt(line, 10, 64). RESP integers can be negative,
-// so don't assume unsigned.
 func (r *Reader) readInteger() (Value, error) {
-	// TODO: implement
-	return Value{}, errors.New("not implemented")
+	line, err := r.readLine()
+	if err != nil {
+		return Value{}, err
+	}
+	n, err := strconv.ParseInt(line, 10, 64)
+	if err != nil {
+		return Value{}, fmt.Errorf("%w: invalid integer %q", ErrProtocol, line)
+	}
+	return Value{Type: Integer, Num: n}, nil
 }
 
 // readBulkString parses everything after a '$' prefix.
-//
-// TODO: implement this. This is the important one — get it right and
-// arrays are easy, since arrays of bulk strings are how every real
-// command arrives.
-//
-// Steps:
-//  1. Read the length line (e.g. "6"). Parse it as an int.
-//  2. Special case: length == -1 means a null bulk string. Return
-//     Value{Type: BulkString, IsNull: true}, nil — do NOT try to read
-//     a body.
-//  3. Otherwise, read EXACTLY that many bytes as the payload, using
-//     io.ReadFull (NOT readLine/ReadString!). Bulk string payloads are
-//     arbitrary bytes and can legally contain \r, \n, or any byte value
-//     — that's the whole point of length-prefixing instead of using a
-//     delimiter. Using a line-based read here is the single most common
-//     bug in hand-rolled RESP parsers.
-//  4. After the payload, the wire still has a trailing "\r\n" you must
-//     consume (and can discard) before returning, so the stream is
-//     correctly positioned for whatever gets read next.
 func (r *Reader) readBulkString() (Value, error) {
-	// TODO: implement
-	return Value{}, errors.New("not implemented")
+	line, err := r.readLine()
+	if err != nil {
+		return Value{}, err
+	}
+	length, err := strconv.Atoi(line)
+	if err != nil {
+		return Value{}, fmt.Errorf("%w: invalid bulk string length %q", ErrProtocol, line)
+	}
+
+	if length == -1 {
+		return Value{Type: BulkString, IsNull: true}, nil
+	}
+
+	// Read EXACTLY `length` bytes — not a line. Payloads can legally
+	// contain \r or \n in the middle; io.ReadFull respects the byte
+	// count regardless of what those bytes are, which is the whole
+	// point of length-prefixing instead of delimiter-based framing.
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r.r, payload); err != nil {
+		return Value{}, err
+	}
+
+	// Consume and discard the trailing \r\n after the payload so the
+	// stream is correctly positioned for the next Read().
+	trailer := make([]byte, 2)
+	if _, err := io.ReadFull(r.r, trailer); err != nil {
+		return Value{}, err
+	}
+
+	return Value{Type: BulkString, Str: string(payload)}, nil
 }
 
 // readArray parses everything after a '*' prefix.
-//
-// TODO: implement this last — it depends on the other four.
-//
-// Steps:
-//  1. Read the count line, parse as int.
-//  2. Special case: count == -1 means a null array. Return
-//     Value{Type: Array, IsNull: true}, nil.
-//  3. Special case: count == 0 is a valid EMPTY array — not an error,
-//     and not the same as null. Return an Array Value with an empty
-//     (non-nil, if you want the distinction to matter) slice.
-//  4. Otherwise, call r.Read() exactly `count` times, recursively — each
-//     element can in principle be any RESP type, though in this project
-//     you'll only ever receive arrays of bulk strings from redis-cli.
-//     Append each parsed Value to the array.
 func (r *Reader) readArray() (Value, error) {
-	// TODO: implement
-	return Value{}, errors.New("not implemented")
+	line, err := r.readLine()
+	if err != nil {
+		return Value{}, err
+	}
+	count, err := strconv.Atoi(line)
+	if err != nil {
+		return Value{}, fmt.Errorf("%w: invalid array length %q", ErrProtocol, line)
+	}
+
+	if count == -1 {
+		return Value{Type: Array, IsNull: true}, nil
+	}
+
+	elements := make([]Value, 0, count)
+	for i := 0; i < count; i++ {
+		elem, err := r.Read()
+		if err != nil {
+			return Value{}, err
+		}
+		elements = append(elements, elem)
+	}
+
+	return Value{Type: Array, Array: elements}, nil
 }
 
 // --- Writer: Value -> bytes (reference implementation, no changes needed) ---

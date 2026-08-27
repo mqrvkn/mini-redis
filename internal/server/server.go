@@ -1,16 +1,15 @@
-// Package server implements the TCP front-end. Week 1 uses a simple
-// space-separated, newline-terminated text protocol. Week 2 replaces the
-// parsing in dispatch/handleConn with real RESP — the Store and the
-// connection-loop concurrency model underneath don't change.
+// Package server implements the TCP front-end. As of Week 2, it speaks
+// real RESP (see internal/resp) so redis-cli and real Redis client
+// libraries can connect directly.
 package server
 
 import (
-	"bufio"
 	"fmt"
 	"log"
 	"net"
 	"strings"
 
+	"mini-redis/internal/resp"
 	"mini-redis/internal/store"
 )
 
@@ -46,39 +45,48 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
-// handleConn owns one client connection for its whole lifetime.
+// handleConn owns one client connection for its whole lifetime. It reads
+// RESP-encoded commands and writes RESP-encoded responses.
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 	remote := conn.RemoteAddr()
 	log.Printf("client connected: %s", remote)
 	defer log.Printf("client disconnected: %s", remote)
 
-	reader := bufio.NewReader(conn)
+	reader := resp.NewReader(conn)
 
 	for {
-		line, err := reader.ReadString('\n')
+		val, err := reader.Read()
 		if err != nil {
+			// Includes io.EOF on clean disconnect, plus any protocol
+			// error from a malformed client — either way, nothing more
+			// can be reliably parsed from this connection.
 			return
 		}
 
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			continue
-		}
-
-		response := s.dispatch(line)
-		if _, err := conn.Write([]byte(response + "\r\n")); err != nil {
+		response := s.dispatch(val)
+		if _, err := conn.Write(response.Marshal()); err != nil {
 			log.Printf("write error to %s: %v", remote, err)
 			return
 		}
 	}
 }
 
-// dispatch parses one line into a command and arguments and executes it.
-func (s *Server) dispatch(line string) string {
-	parts := strings.Fields(line)
-	if len(parts) == 0 {
-		return "-ERR empty command"
+// dispatch takes one parsed RESP value — expected to be an Array of
+// BulkStrings, exactly what redis-cli sends for every command — and
+// returns the RESP response to write back.
+func (s *Server) dispatch(val resp.Value) resp.Value {
+	if val.Type != resp.Array || len(val.Array) == 0 {
+		return resp.ErrorValue("ERR expected command as array of bulk strings")
+	}
+
+	// Pull the command name and arguments out of the array.
+	parts := make([]string, len(val.Array))
+	for i, elem := range val.Array {
+		if elem.Type != resp.BulkString || elem.IsNull {
+			return resp.ErrorValue("ERR command elements must be bulk strings")
+		}
+		parts[i] = elem.Str
 	}
 
 	cmd := strings.ToUpper(parts[0])
@@ -86,44 +94,44 @@ func (s *Server) dispatch(line string) string {
 
 	switch cmd {
 	case "PING":
-		return "+PONG"
+		return resp.SimpleStringValue("PONG")
 
 	case "SET":
 		if len(args) != 2 {
-			return "-ERR usage: SET key value"
+			return resp.ErrorValue("ERR usage: SET key value")
 		}
 		s.db.Set(args[0], args[1])
-		return "+OK"
+		return resp.SimpleStringValue("OK")
 
 	case "GET":
 		if len(args) != 1 {
-			return "-ERR usage: GET key"
+			return resp.ErrorValue("ERR usage: GET key")
 		}
 		v, ok := s.db.Get(args[0])
 		if !ok {
-			return "$-1"
+			return resp.NullBulkString()
 		}
-		return "$" + v
+		return resp.BulkStringValue(v)
 
 	case "DEL":
 		if len(args) != 1 {
-			return "-ERR usage: DEL key"
+			return resp.ErrorValue("ERR usage: DEL key")
 		}
 		if s.db.Del(args[0]) {
-			return ":1"
+			return resp.IntegerValue(1)
 		}
-		return ":0"
+		return resp.IntegerValue(0)
 
 	case "EXISTS":
 		if len(args) != 1 {
-			return "-ERR usage: EXISTS key"
+			return resp.ErrorValue("ERR usage: EXISTS key")
 		}
 		if s.db.Exists(args[0]) {
-			return ":1"
+			return resp.IntegerValue(1)
 		}
-		return ":0"
+		return resp.IntegerValue(0)
 
 	default:
-		return "-ERR unknown command '" + cmd + "'"
+		return resp.ErrorValue("ERR unknown command '" + cmd + "'")
 	}
 }
