@@ -406,6 +406,37 @@ func (s *Store) LLen(key string) (int, error) {
 //  5. Otherwise return e.list[start : stop+1] (remember Go slice
 //     upper bounds are exclusive, hence the +1 to make stop inclusive).
 func (s *Store) LRange(key string, start, stop int) ([]string, error) {
-	// TODO: implement
-	return nil, nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, existed := s.data[key]
+	if !existed {
+		return nil, nil
+	
+	}
+	if e.vtype != typeList {
+		return nil, ErrWrongType
+	}
+	if start < 0 {
+		start += len(e.list)
+
+	}
+	if stop < 0 {
+		stop += len(e.list)
+	}
+	if start < 0 {
+		start = 0
+
+	}
+	if stop > len(e.list) - 1 {
+		stop = len(e.list) - 1
+
+	}
+	if start > stop {
+		return []string{}, nil
+
+	}
+
+	return e.list[start : stop + 1], nil
+
 }
