@@ -23,31 +23,26 @@ DEL foo
 GET foo
 ```
 
-## Week 2 (in progress)
+## Week 2 (done)
 
-`internal/resp/resp.go` has a skeleton for the real RESP wire protocol —
-`Read()` and its helpers are stubbed with TODOs. `internal/resp/resp_test.go`
-has the full test suite; get it passing:
+`internal/resp/resp.go` implements the real RESP wire protocol: `Read()`
+parses Simple Strings, Errors, Integers, Bulk Strings (including null and
+embedded-CRLF payloads), and Arrays (including nested and null arrays).
+`internal/server/server.go` now uses `resp.Reader`/`Value.Marshal()`
+instead of the old newline-delimited text protocol, so real `redis-cli`
+can connect directly:
 
 ```
-go test ./internal/resp/...
+go test ./internal/resp/...   # full parser test suite
+go run ./cmd/server            # start the server
+redis-cli -p 6380              # in another tab, if you have redis-cli installed
 ```
 
-Suggested order to implement in `resp.go`:
-1. `readLine` — the primitive everything else (except bulk string bodies) uses
-2. `readSimpleString` and `readError` — simplest cases, sanity-check readLine
-3. `readInteger`
-4. `readBulkString` — the important one; pay attention to the length-prefix
-   note in the comment
-5. `readArray` — depends on all of the above
-6. `Read` — dispatch on the type-prefix byte to the right helper above
+Then in the `redis-cli` session: `SET foo bar`, `GET foo`, `DEL foo`, etc.
+work exactly like talking to real Redis.
 
-Run `go test ./internal/resp/... -v` to see which specific case fails as you
-go — the tests are ordered to match the implementation order above.
-
-Once all tests pass, the next step (not yet wired up) is swapping
-`server.dispatch`'s `strings.Fields` line parsing for `resp.Reader`, so
-`redis-cli -p 6380` can talk to the server directly.
+If you don't have `redis-cli` installed: `brew install redis` on macOS
+gets you the CLI tool without needing to run the actual Redis server.
 
 ## Project layout
 
